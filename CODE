@@ -16,20 +16,18 @@
 #define TRIG_PIN_2 10 
 #define ECHO_PIN_2 11
 
-float tau = 2.0;
-float Ts = 0.1;
-float alpha;
-
-// Variables to keep track of distance smoothing
-float filteredDistance1 = 0; 
-float previousFiltered1 = 0; 
-float filteredDistance2 = 0; 
-float previousFiltered2 = 0;
-
+// System Timing & Thresholds
 unsigned long minGreen = 10000;      // 10 seconds minimum
-unsigned long maxGreen = 60000;     // 60 seconds maximum
-float minDetectionThreshold = 1.0;  // Minimum distance in cm
-float maxDetectionThreshold = 100.0; // Maximum distance in cm
+unsigned long maxGreen = 30000;      // 30 seconds maximum
+float minDetectionThreshold = 10.0;
+float maxDetectionThreshold = 100.0;
+
+// Laplace Transform (First-Order Low-Pass Filter) Variables
+float tau = 0.5;                     // Time constant (lower = faster response)
+float Ts = 0.1;                      // Sample time (approx 100ms loop delay)
+float alpha;
+float prevActiveDist = 999.0;
+float prevCrossDist = 999.0;
 
 void setup() { 
   Serial.begin(9600);
@@ -48,66 +46,100 @@ void setup() {
   pinMode(YELLOW_PIN_2, OUTPUT); 
   pinMode(GREEN_PIN_2, OUTPUT);
 
-  alpha = Ts / (tau + Ts); 
+  // Calculate discrete filter coefficient
+  alpha = Ts / (tau + Ts);
 }
 
-float readDistance(int trigPin, int echoPin) { 
+float readRawDistance(int trigPin, int echoPin) { 
   digitalWrite(trigPin, LOW); 
   delayMicroseconds(2); 
   digitalWrite(trigPin, HIGH); 
   delayMicroseconds(10); 
   digitalWrite(trigPin, LOW); 
-  long duration = pulseIn(echoPin, HIGH); 
-  float distance = duration * 0.034 / 2; 
-  return distance; 
+  
+  // 30000us timeout prevents hardware freeze
+  long duration = pulseIn(echoPin, HIGH, 30000); 
+  
+  if (duration == 0) {
+    return 999.0; 
+  }
+  
+  return duration * 0.034 / 2; 
 }
 
-// New intelligent function that monitors BOTH sensors during a green light
-void monitorGreenPhase(int activeTrig, int activeEcho, float &activeFilt, float &activePrev,
-                       int crossTrig, int crossEcho, float &crossFilt, float &crossPrev) {
-                         
+void monitorGreenPhase(int activeTrig, int activeEcho, int crossTrig, int crossEcho) {
   unsigned long startTime = millis();
+  int emptyLaneCounter = 0;
+  int bothLaneCounter = 0;
+  int crossLaneCounter = 0;
 
-  // Keep green light on up to the maximum 60 seconds
+  // Reset filter baseline for new phase
+  prevActiveDist = 999.0;
+  prevCrossDist = 999.0;
+
   while (millis() - startTime < maxGreen) { 
     
-    // 1. Read the lane that currently has the GREEN light
-    float activeDist = readDistance(activeTrig, activeEcho);
-    activeFilt = activePrev + alpha * (activeDist - activePrev);
-    activePrev = activeFilt;
-    bool activeCar = (activeFilt >= minDetectionThreshold) && (activeFilt <= maxDetectionThreshold);
+    // Read and Filter Active Lane
+    float rawActive = readRawDistance(activeTrig, activeEcho);
+    float activeDist = prevActiveDist + alpha * (rawActive - prevActiveDist);
+    prevActiveDist = activeDist;
+    bool activeCar = (activeDist >= minDetectionThreshold) && (activeDist <= maxDetectionThreshold);
 
-    // 2. Read the lane that currently has the RED light (Cross traffic)
-    float crossDist = readDistance(crossTrig, crossEcho);
-    crossFilt = crossPrev + alpha * (crossDist - crossPrev);
-    crossPrev = crossFilt;
-    bool crossCar = (crossFilt >= minDetectionThreshold) && (crossFilt <= maxDetectionThreshold);
+    // Acoustic interference prevention delay
+    delay(40); 
 
-    // Has the mandatory minimum 3 seconds passed?
+    // Read and Filter Cross Lane
+    float rawCross = readRawDistance(crossTrig, crossEcho);
+    float crossDist = prevCrossDist + alpha * (rawCross - prevCrossDist);
+    prevCrossDist = crossDist;
+    bool crossCar = (crossDist >= minDetectionThreshold) && (crossDist <= maxDetectionThreshold);
+
+    Serial.print("Filtered Active: ");
+    Serial.print(activeDist);
+    Serial.print(" cm | Filtered Cross: ");
+    Serial.print(crossDist);
+    Serial.println(" cm");
+
     bool minTimePassed = (millis() - startTime) >= minGreen;
 
     if (minTimePassed) {
-      // RULE 1: If BOTH lanes have cars, force a switch so the other side doesn't wait 60s
+      if (crossCar && !activeCar) {
+        crossLaneCounter++;
+        if (crossLaneCounter >= 3) {
+          Serial.println("Cross traffic detected. Active empty. Switching.");
+          break;
+        }
+      } else {
+        crossLaneCounter = 0;
+      }
+
       if (activeCar && crossCar) {
-        Serial.println("Cars detected on BOTH sides. Proceeding in minimum time (Switching).");
-        break; 
+        bothLaneCounter++;
+        if (bothLaneCounter >= 3) {
+          Serial.println("Both lanes full. Switching.");
+          break; 
+        }
+      } else {
+        bothLaneCounter = 0; 
       }
       
-      // RULE 2: If the current lane is empty, cut the green light early
-      if (!activeCar) {
-        Serial.println("Active lane is clear. Switching early.");
-        break;
+      if (!activeCar && !crossCar) {
+        emptyLaneCounter++;
+        if (emptyLaneCounter >= 3) {
+          Serial.println("Both lanes clear. Switching.");
+          break;
+        }
+      } else {
+        emptyLaneCounter = 0; 
       }
-      
-      // If activeCar is true AND crossCar is false, the loop naturally continues up to 60s
     }
 
-    delay(50); // Small buffer to prevent ultrasonic sensor interference
+    // Remaining delay to approximate Ts = 0.1s
+    delay(60); 
   }
 }
 
 void loop() { 
-  // Phase 1: Stoplight 1 is GREEN, Stoplight 2 is RED 
   digitalWrite(RED_PIN_1, LOW); 
   digitalWrite(YELLOW_PIN_1, LOW); 
   digitalWrite(GREEN_PIN_1, HIGH);
@@ -117,16 +149,12 @@ void loop() {
   digitalWrite(GREEN_PIN_2, LOW);
 
   Serial.println("--- Light 1 is GREEN ---");
-  // Monitor Light 1 as active, Light 2 as cross traffic
-  monitorGreenPhase(TRIG_PIN_1, ECHO_PIN_1, filteredDistance1, previousFiltered1,
-                    TRIG_PIN_2, ECHO_PIN_2, filteredDistance2, previousFiltered2);
+  monitorGreenPhase(TRIG_PIN_1, ECHO_PIN_1, TRIG_PIN_2, ECHO_PIN_2);
 
-  // Phase 2: Stoplight 1 is YELLOW, Stoplight 2 is RED 
   digitalWrite(GREEN_PIN_1, LOW); 
   digitalWrite(YELLOW_PIN_1, HIGH);
   delay(2000);
 
-  // Phase 3: Stoplight 1 is RED, Stoplight 2 is GREEN 
   digitalWrite(YELLOW_PIN_1, LOW); 
   digitalWrite(RED_PIN_1, HIGH);
 
@@ -134,11 +162,8 @@ void loop() {
   digitalWrite(GREEN_PIN_2, HIGH);
 
   Serial.println("--- Light 2 is GREEN ---");
-  // Monitor Light 2 as active, Light 1 as cross traffic
-  monitorGreenPhase(TRIG_PIN_2, ECHO_PIN_2, filteredDistance2, previousFiltered2,
-                    TRIG_PIN_1, ECHO_PIN_1, filteredDistance1, previousFiltered1);
+  monitorGreenPhase(TRIG_PIN_2, ECHO_PIN_2, TRIG_PIN_1, ECHO_PIN_1);
 
-  // Phase 4: Stoplight 1 is RED, Stoplight 2 is YELLOW 
   digitalWrite(GREEN_PIN_2, LOW); 
   digitalWrite(YELLOW_PIN_2, HIGH);
   delay(2000); 
